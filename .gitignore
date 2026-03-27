@@ -1,0 +1,9 @@
+data/
+embeddings/
+results/
+__pycache__/
+*.pyc
+.env
+.idea/
+.vscode/
+ImplementationPlan.md
