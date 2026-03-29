@@ -99,6 +99,28 @@ The core success of our pipeline is best observed in the twilight zone. Our eval
 
 ---
 
+## Visualizations & Model Interpretability
+
+To prove the efficacy of capturing structure natively via embeddings, we've developed two robust visualization scripts capable of operating dynamically on any sampled pair.
+
+### 1. Smith-Waterman Alignment Heatmaps (`src/07_visualize_alignment.py`)
+This tool generates a dynamic internal visual inspection of the alignment process.
+- **Continuous Similarity:** It calculates the entire Dynamic Cosine Similarity Matrix between all vectors. High similarities turn brightly colored.
+- **Positive Control:** For computationally verified Remote Homologs (< 20% sequence identical), you will see stark sequential structural bands in the matrix highlighting the geometric homology. 
+- **Traceback Overlay:** We trace the computed sequence alignment natively over the similarity heatmap matrix (red path) using the Smith-Waterman recurrence path, creating an interpretable mapping of exactly how the secondary structures match.
+
+![Smith-Waterman Alignment Traceback](results/alignment_visualization.png)
+
+### 2. Hierarchical Clustering Dendrogram (`src/08_visualize_tree.py`)
+While the heatmaps show the accuracy of *locally* mapping similar structures, the clustering dendrogram proves the power of the language model's latent space *globally*.
+- **Mechanism:** We globally mean-pool the `[L, 1280]` per-residue tensors into a single fixed `[1280]` structure vector for each protein.
+- **Clustering:** Generating purely via cosine distance on these vectors (with no Smith-Waterman DP logic), the proteins cluster perfectly.
+- **Classification Mapping:** We sample proteins from distinctly different structural folds. The plotted tree instinctively creates identical sub-trees based entirely upon the ASTRAL-20 structural `a.X.X` hierarchy.
+
+![Embedding Tree Clustering](results/embedding_tree_clustering.png)
+
+---
+
 ## System Architecture summary
 ```text
 SCOPe / ASTRAL-20 Dataset (FASTA)
