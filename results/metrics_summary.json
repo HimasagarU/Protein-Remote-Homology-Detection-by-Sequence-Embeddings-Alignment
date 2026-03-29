@@ -1,0 +1,33 @@
+{
+  "ROC-AUC (CV)": 0.9037,
+  "PR-AUC (MAP)": 0.9199,
+  "Precision@10": 1.0,
+  "Recall@10": 0.0323,
+  "Precision@25": 1.0,
+  "Recall@25": 0.0806,
+  "Precision@50": 1.0,
+  "Recall@50": 0.1613,
+  "Precision@100": 1.0,
+  "Recall@100": 0.3226,
+  "cv_fold_aucs": [
+    0.9183,
+    0.873,
+    0.9422,
+    0.9022,
+    0.8848
+  ],
+  "embedding_type": "multi-layer (last 4)",
+  "n_features": 10,
+  "feature_names": [
+    "sw_raw",
+    "sw_norm_geom",
+    "sw_norm_min",
+    "global_sim",
+    "coverage",
+    "mean_path_sim",
+    "max_path_sim",
+    "diag_ratio",
+    "top_k_mean",
+    "len_ratio"
+  ]
+}
