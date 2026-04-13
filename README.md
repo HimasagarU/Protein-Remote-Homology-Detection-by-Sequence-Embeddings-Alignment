@@ -42,70 +42,54 @@ We utilize the ASTRAL-20 dataset, which filters the SCOPe database so that no tw
 
 ## Methods and Pipeline
 
-The system is decoupled into five distinct phases:
+The repository now supports two clean, reproducible versions:
+
+- `v1` baseline: final-layer ESM-2 embeddings + residue-level cosine similarity + Smith-Waterman scoring
+- `v3` final model: last-4-layer averaged embeddings + richer alignment features + logistic regression
 
 ### Phase 1: Data Acquisition & Labeling
-We clean the ASTRAL-20 fasta file and construct `scop_labels.csv`. From this, we randomly sample sequences to build equally balanced `test_pairs.csv` mapping remote homologous pairs.
+`src/01_data_prep.py` parses the ASTRAL-20 FASTA headers, extracts SCOPe hierarchy labels, filters invalid or overly long sequences, and creates a balanced `test_pairs.csv` where:
+- positive pairs = same superfamily, different family
+- negative pairs = different superfamily
 
 ### Phase 2: ESM-2 Embedding Extraction
-**Why ESM-2?** Training an ELMo or BERT model from scratch requires weeks of GPU time and millions of sequences. ESM-2 is a pre-trained Transformer encoder by Meta, trained via masked language modeling. Its hidden states offer strong structural awareness with **zero** further training required. 
+`src/02_embed.py` supports both pipeline versions with the same backbone model, `esm2_t33_650M_UR50D`.
 
-For this pipeline, we use the `esm2_t33_650M_UR50D` (650M parameter) model. 
-- **Input:** Amino acid string of length $L$
-- **Output:** Tensor of shape $[L, 1280]$, representing one 1280-dimensional vector per residue position.
-The representations are extracted and saved as `.pt` (PyTorch tensor) files.
+- `v1` saves the final hidden layer to `embeddings/`
+- `v3` averages the last 4 hidden layers and saves to `embeddings_v3/`
+
+Each protein is represented as a tensor of shape `[L, 1280]`, where `L` is the sequence length.
 
 ### Phase 3: Dynamic Cosine Similarity Matrix
-Instead of a static substitution matrix (like BLOSUM), we dynamically compute a customized similarity matrix for every pair of proteins evaluated.
-
-Let Protein A have length $M$ and Protein B have length $N$. Their embedding matrices are $\mathbf{E}_A \in \mathbb{R}^{M \times 1280}$ and $\mathbf{E}_B \in \mathbb{R}^{N \times 1280}$.
-We compute the pairwise cosine similarity for every residue in A against every residue in B:
+`src/03_similarity.py` builds a residue-residue cosine similarity matrix for a protein pair:
 $$S_{i,j} = \frac{\mathbf{E}_{A,i} \cdot \mathbf{E}_{B,j}}{\|\mathbf{E}_{A,i}\| \|\mathbf{E}_{B,j}\|}$$
 
-This generates a similarity matrix $\mathbf{S}$ of shape $[M, N]$, with values in $[-1, 1]$. +1 means identical structural context, -1 means structurally opposite.
+This produces a matrix of shape `[M, N]` for proteins of lengths `M` and `N`.
 
 ### Phase 4: Dynamic Programming Alignment
-With the dynamic continuous similarity matrix $\mathbf{S}$ computed, we deploy optimal alignment algorithms to find the best structural path.
+`src/04_alignment.py` performs dynamic programming on the cosine similarity matrix.
 
-**Algorithm Selection:**
-- **Smith-Waterman (Local Alignment):** Preferred and default. Remote homologs often only share a conserved structural core or domain, not their entire length.
-- **Needleman-Wunsch (Global Alignment):** Used for full-length comparisons of similarly sized proteins.
+- Smith-Waterman is used for local alignment with affine gaps
+- Needleman-Wunsch is available for global alignment with affine gaps
 
-The recurrence relation for our modified Smith-Waterman is:
-$$F(i, j) = \max \begin{cases} 0 \\ F(i-1,\, j-1) + S_{i,j} & \text{(match)} \\ F(i-1,\, j) + g & \text{(gap in B)} \\ F(i,\, j-1) + g & \text{(gap in A)} \end{cases}$$
-Where $g$ is the gap penalty (default $-1.0$). The final score heavily indicates structural homology.
+The local path returned by the code stores matched residue pairs only, so downstream coverage features stay well defined.
 
-### Phase 5: Implementation Improvements & Acceleration
-Because standard nested loops in pure Python are excessively slow for determining grid-based DP paths on $[1000 \times 1000]$ grids, we utilize **Numba's Just-In-Time (`@numba.njit`) compiler**. 
-Decorating the Smith-Waterman function with Numba yields a massive ~50x speedup, making alignment computations practically instantaneous even for sequence lengths up to 1022. GPU acceleration handles the heavy lifting sequence inference for the ESM-2 embeddings.
+### Phase 5: Baseline Benchmark (`v1`)
+`src/05_benchmark.py` evaluates raw Smith-Waterman scores as a ranking signal and writes baseline outputs to `results_v1_baseline/`.
 
-### Phase 6: Tier 3 Optimization (Multi-Layer & Rich Feature Set)
-To breach the >0.88 ROC-AUC milestone, we implemented a state-of-the-art classifier combining 10 distinct geometric and alignment-based features extracted from **multi-layer** ESM-2 embeddings (averaging the last 4 hidden layers). This feature vector (consisting of normalized affine-gap scores, global similarities, diagonal path energies, and structural coverage) is fed into a **Logistic Regression** model trained using robust **5-Fold Stratified Cross-Validation**.
+### Phase 6: Final Feature Model (`v3`)
+`src/06_improve.py` extracts 10 features from `v3` embeddings, including normalized alignment scores, pooled cosine similarity, path statistics, and matrix concentration features. The final classifier is logistic regression with protein-disjoint cross-validation, and outputs are written to `results/`.
 
----
+### Phases 7-8: Visualization
+`src/07_visualize_alignment.py` and `src/08_visualize_tree.py` can be run for either version to generate presentation-ready figures.
 
-### Performance Comparison: Actual vs. Expected
+### Interpreting Results
+To compare `v1` against `v3`, rerun the scripts after embedding extraction and compare:
+- `results_v1_baseline/embedding_scores.csv`
+- `results/metrics_summary.json`
+- `results/improved_v3_scores.csv`
 
-The table below compares our finalized ESM-2 Alignment (Tier 3) against traditional algorithms and our original target performance.
-
-| Metric | BLAST | PSI-BLAST | HHSearch | **Target Target** | **ESM-2 Align (Tier 3)** |
-|---|---|---|---|---|---|
-| **ROC-AUC** | ~0.60 | ~0.72 | ~0.85 | **> 0.88** | **0.904** |
-| Precision@50 | Low | Medium | High | **High** | **1.000** |
-| Recall@50 | Low | Medium | High | **High** | **0.161** |
-| Handles twilight zone (<20% ID) | No | Partial | Partial | **Yes** | **Yes** |
-| Requires Sequence DB? | Yes | Yes | Yes | **No** | **No** |
-
----
-
-### Key Analysis: Conquering the Twilight Zone
-The core success of our pipeline is best observed in the twilight zone (ASTRAL-20 dataset). While BLAST often fails to register significant hits (bitscore < 50), our ESM-2 alignment strongly maps structural domains by leveraging geometric continuous space representations instead of discrete textual characters. 
-
-By aggregating signals across multiple ESM-2 transformer layers and engineering deeper structural alignment features dynamically, the **Tier 3 pipeline** completely eliminated data leakage (via 5-fold CV) and proved that geometric deep learning can uncover phenomenally robust structural homologs indistinguishable by sequence alone. The model successfully achieved a **1.000 Precision@50**, meaning the top 50 hits contain exactly zero false positives.
-
-![Comprehensive Performance Dashboard](results/v3_dashboard.png)
-
----
+`v2` has been removed from the codebase and is no longer a supported experiment.
 
 ---
 
@@ -131,7 +115,7 @@ While the heatmaps show the accuracy of *locally* mapping similar structures, th
 
 ---
 
-## System Architecture summary
+## System Architecture Summary
 ```text
 SCOPe / ASTRAL-20 Dataset (FASTA)
             |
@@ -141,7 +125,7 @@ SCOPe / ASTRAL-20 Dataset (FASTA)
             |
             v
   [ Phase 2 ] ESM-2 Embedding Extraction
-  Per-residue vectors: [L x 1280]
+  v1 final layer or v3 last-4-layer average
             |
             v
   [ Phase 3 ] Dynamic Cosine Similarity Matrix
@@ -152,7 +136,10 @@ SCOPe / ASTRAL-20 Dataset (FASTA)
   Optimal structural alignment path + score
             |
             v
-  [ Phase 5 ] Benchmarking vs. BLAST / PSI-BLAST / HHSearch
+  [ Phase 5 ] Baseline Benchmarking
+            |
+            v
+  [ Phase 6 ] v3 Feature Model + Protein-Disjoint CV
 ```
 
 ## Setup and Run
@@ -174,7 +161,40 @@ pip install torch torchvision torchaudio --index-url https://download.pytorch.or
 pip install transformers biopython pandas scikit-learn numpy matplotlib numba
 ```
 
-Follow the execution scripts in `src/` modularly form `01_data_prep.py` through `05_benchmark.py` to recreate the results!
+### Run Order
+
+Prepare the dataset once:
+
+```bash
+python src/01_data_prep.py
+```
+
+Run the `v1` baseline:
+
+```bash
+python src/02_embed.py --version v1
+python src/05_benchmark.py --version v1
+python src/07_visualize_alignment.py --version v1
+python src/08_visualize_tree.py --version v1
+```
+
+Run the `v3` final model:
+
+```bash
+python src/02_embed.py --version v3
+python src/06_improve.py
+python src/07_visualize_alignment.py --version v3
+python src/08_visualize_tree.py --version v3
+```
+
+Optional quick sanity checks:
+
+```bash
+python src/03_similarity.py --version v1
+python src/03_similarity.py --version v3
+python src/04_alignment.py --version v1 --pairs 3
+python src/04_alignment.py --version v3 --pairs 3
+```
 
 ---
 

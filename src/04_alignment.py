@@ -1,154 +1,258 @@
 """
-Phase 4 -- Dynamic Programming Alignment.
+Phase 4 -- Dynamic programming alignment on ESM-2 similarity matrices.
 
-Smith-Waterman (local) and Needleman-Wunsch (global) alignment
-on ESM-2 cosine similarity matrices.
+Smith-Waterman uses affine gaps and returns a residue-residue match path.
+Needleman-Wunsch uses affine gaps for full-length alignment.
 """
+
+import argparse
 
 import numpy as np
 import torch
-from pathlib import Path
 import torch.nn.functional as F
-
-def compute_similarity_matrix(emb_a, emb_b):
-    """Cosine similarity matrix [M, N] from embeddings [M,D] and [N,D]."""
-    return torch.mm(F.normalize(emb_a, dim=1), F.normalize(emb_b, dim=1).T)
-
-EMB_DIR = Path(__file__).resolve().parent.parent / "embeddings"
-
-
 from numba import njit
 
+from pipeline_common import DATA_DIR, load_embedding, normalize_version
+
+
+NEG_INF = np.float32(-1e9)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Align protein pairs with Smith-Waterman or Needleman-Wunsch.")
+    parser.add_argument("--version", choices=["v1", "v3"], default="v1")
+    parser.add_argument("--mode", choices=["local", "global"], default="local")
+    parser.add_argument("--pairs", type=int, default=5, help="Number of test pairs to preview.")
+    parser.add_argument("--gap-open", type=float, default=-1.0)
+    parser.add_argument("--gap-extend", type=float, default=-0.1)
+    return parser.parse_args()
+
+
+def compute_similarity_matrix(emb_a: torch.Tensor, emb_b: torch.Tensor) -> torch.Tensor:
+    norm_a = F.normalize(emb_a, dim=1)
+    norm_b = F.normalize(emb_b, dim=1)
+    return torch.mm(norm_a, norm_b.T)
+
+
 @njit
-def _smith_waterman_numba(S, gap_open=-1.0, gap_extend=-0.1):
-    """
-    Numba-optimized SW with Affine Gaps.
-    gap_open: Penalty for opening a gap (charged once)
-    gap_extend: Penalty for extending an already open gap
-    """
+def _smith_waterman_affine_numba(S, gap_open, gap_extend):
     M, N = S.shape
-    # F: Match/Mismatch, IX: Gap in row, IY: Gap in column
-    F  = np.zeros((M + 1, N + 1), dtype=np.float32)
-    IX = np.zeros((M + 1, N + 1), dtype=np.float32)
-    IY = np.zeros((M + 1, N + 1), dtype=np.float32)
-    TB = np.zeros((M + 1, N + 1), dtype=np.int8) # 0=stop, 1=diag, 2=up, 3=left
-    
-    max_score, max_pos = 0.0, (0, 0)
-    
-    # Initialize IX/IY with very small values to avoid opening gaps at 0
-    # Actually for local alignment, 0 is the floor.
-    
+    H = np.zeros((M + 1, N + 1), dtype=np.float32)
+    E = np.full((M + 1, N + 1), NEG_INF, dtype=np.float32)
+    G = np.full((M + 1, N + 1), NEG_INF, dtype=np.float32)
+
+    H_tb = np.zeros((M + 1, N + 1), dtype=np.int8)  # 0 stop, 1 diag, 2 E, 3 G
+    E_tb = np.zeros((M + 1, N + 1), dtype=np.int8)  # 1 open from H, 2 extend E
+    G_tb = np.zeros((M + 1, N + 1), dtype=np.int8)  # 1 open from H, 2 extend G
+
+    max_score = 0.0
+    max_i = 0
+    max_j = 0
+
     for i in range(1, M + 1):
         for j in range(1, N + 1):
-            # Diag match
-            diag = F[i-1, j-1] + S[i-1, j-1]
-            
-            # Update IX (gap in B / deletion in A)
-            # IX[i,j] can come from Match Matrix (open) or from IX itself (extend)
-            ix_open   = F[i-1, j] + gap_open + gap_extend
-            ix_extend = IX[i-1, j] + gap_extend
-            IX[i, j]  = max(ix_open, ix_extend)
-            
-            # Update IY (gap in A / insertion in A)
-            iy_open   = F[i, j-1] + gap_open + gap_extend
-            iy_extend = IY[i, j-1] + gap_extend
-            IY[i, j]  = max(iy_open, iy_extend)
-            
-            best = max(0.0, diag, IX[i, j], IY[i, j])
-            F[i, j] = best
-            
-            if   best == 0.0: TB[i, j] = 0
-            elif best == diag: TB[i, j] = 1
-            elif best == IX[i, j]: TB[i, j] = 2
-            else:              TB[i, j] = 3
-            
+            open_e = H[i - 1, j] + gap_open
+            extend_e = E[i - 1, j] + gap_extend
+            if open_e >= extend_e:
+                E[i, j] = open_e
+                E_tb[i, j] = 1
+            else:
+                E[i, j] = extend_e
+                E_tb[i, j] = 2
+
+            open_g = H[i, j - 1] + gap_open
+            extend_g = G[i, j - 1] + gap_extend
+            if open_g >= extend_g:
+                G[i, j] = open_g
+                G_tb[i, j] = 1
+            else:
+                G[i, j] = extend_g
+                G_tb[i, j] = 2
+
+            diag = H[i - 1, j - 1] + S[i - 1, j - 1]
+            best = diag
+            tb = 1
+            if E[i, j] > best:
+                best = E[i, j]
+                tb = 2
+            if G[i, j] > best:
+                best = G[i, j]
+                tb = 3
+            if best < 0.0:
+                best = 0.0
+                tb = 0
+
+            H[i, j] = best
+            H_tb[i, j] = tb
+
             if best > max_score:
-                max_score, max_pos = best, (i, j)
-                
-    # Traceback
+                max_score = best
+                max_i = i
+                max_j = j
+
     path = []
-    curr_i, curr_j = max_pos
-    while TB[curr_i, curr_j] != 0:
-        path.append((curr_i - 1, curr_j - 1))
-        t = TB[curr_i, curr_j]
-        if   t == 1: curr_i -= 1; curr_j -= 1
-        elif t == 2: curr_i -= 1
-        else:        curr_j -= 1
-            
-    return float(max_score), path[::-1]
+    state = 0  # 0 = H, 1 = E, 2 = G
+    i = max_i
+    j = max_j
 
+    while i > 0 and j > 0:
+        if state == 0:
+            tb = H_tb[i, j]
+            if tb == 0:
+                break
+            if tb == 1:
+                path.append((i - 1, j - 1))
+                i -= 1
+                j -= 1
+            elif tb == 2:
+                state = 1
+            else:
+                state = 2
+        elif state == 1:
+            tb = E_tb[i, j]
+            i -= 1
+            if tb == 1:
+                state = 0
+        else:
+            tb = G_tb[i, j]
+            j -= 1
+            if tb == 1:
+                state = 0
 
-def smith_waterman(S: np.ndarray, gap_penalty: float = -1.0):
-    """
-    Compatibility wrapper. Interprets gap_penalty as gap_open+gap_extend.
-    Defaulting gap_extend to gap_penalty/10 if not provided separately.
-    """
-    return _smith_waterman_numba(S, gap_open=gap_penalty, gap_extend=gap_penalty*0.1)
+    path.reverse()
+    return float(max_score), path
 
 
 @njit
-def _needleman_wunsch_numba(S, gap_penalty):
+def _needleman_wunsch_affine_numba(S, gap_open, gap_extend):
     M, N = S.shape
-    F  = np.full((M + 1, N + 1), -1e9, dtype=np.float32)
-    TB = np.zeros((M + 1, N + 1), dtype=np.int8)
-    F[0, 0] = 0.0
-    for i in range(1, M + 1): F[i, 0] = i * gap_penalty
-    for j in range(1, N + 1): F[0, j] = j * gap_penalty
+    H = np.full((M + 1, N + 1), NEG_INF, dtype=np.float32)
+    E = np.full((M + 1, N + 1), NEG_INF, dtype=np.float32)
+    G = np.full((M + 1, N + 1), NEG_INF, dtype=np.float32)
+
+    H_tb = np.zeros((M + 1, N + 1), dtype=np.int8)
+    E_tb = np.zeros((M + 1, N + 1), dtype=np.int8)
+    G_tb = np.zeros((M + 1, N + 1), dtype=np.int8)
+
+    H[0, 0] = 0.0
+    for i in range(1, M + 1):
+        E[i, 0] = gap_open if i == 1 else E[i - 1, 0] + gap_extend
+        H[i, 0] = E[i, 0]
+        H_tb[i, 0] = 2
+        E_tb[i, 0] = 1 if i == 1 else 2
+    for j in range(1, N + 1):
+        G[0, j] = gap_open if j == 1 else G[0, j - 1] + gap_extend
+        H[0, j] = G[0, j]
+        H_tb[0, j] = 3
+        G_tb[0, j] = 1 if j == 1 else 2
 
     for i in range(1, M + 1):
         for j in range(1, N + 1):
-            diag = F[i-1, j-1] + S[i-1, j-1]
-            up   = F[i-1, j]   + gap_penalty
-            left = F[i,   j-1] + gap_penalty
-            best = max(diag, up, left)
-            F[i, j] = best
-            if   best == diag: TB[i, j] = 1
-            elif best == up:   TB[i, j] = 2
-            else:              TB[i, j] = 3
-    
-    path, curr_i, curr_j = [], M, N
-    while curr_i > 0 or curr_j > 0:
-        path.append((curr_i - 1, curr_j - 1))
-        t = TB[curr_i, curr_j]
-        if   t == 1: curr_i -= 1; curr_j -= 1
-        elif t == 2: curr_i -= 1
-        else:        curr_j -= 1
-    return float(F[M, N]), path[::-1]
+            open_e = H[i - 1, j] + gap_open
+            extend_e = E[i - 1, j] + gap_extend
+            if open_e >= extend_e:
+                E[i, j] = open_e
+                E_tb[i, j] = 1
+            else:
+                E[i, j] = extend_e
+                E_tb[i, j] = 2
+
+            open_g = H[i, j - 1] + gap_open
+            extend_g = G[i, j - 1] + gap_extend
+            if open_g >= extend_g:
+                G[i, j] = open_g
+                G_tb[i, j] = 1
+            else:
+                G[i, j] = extend_g
+                G_tb[i, j] = 2
+
+            diag = H[i - 1, j - 1] + S[i - 1, j - 1]
+            best = diag
+            tb = 1
+            if E[i, j] > best:
+                best = E[i, j]
+                tb = 2
+            if G[i, j] > best:
+                best = G[i, j]
+                tb = 3
+
+            H[i, j] = best
+            H_tb[i, j] = tb
+
+    path = []
+    state = 0
+    i = M
+    j = N
+
+    while i > 0 or j > 0:
+        if state == 0:
+            tb = H_tb[i, j]
+            if tb == 1 and i > 0 and j > 0:
+                path.append((i - 1, j - 1))
+                i -= 1
+                j -= 1
+            elif tb == 2 and i > 0:
+                state = 1
+            elif tb == 3 and j > 0:
+                state = 2
+            else:
+                break
+        elif state == 1:
+            tb = E_tb[i, j]
+            i -= 1
+            if tb == 1:
+                state = 0
+        else:
+            tb = G_tb[i, j]
+            j -= 1
+            if tb == 1:
+                state = 0
+
+    path.reverse()
+    return float(H[M, N]), path
 
 
-def needleman_wunsch(S: np.ndarray, gap_penalty: float = -1.0):
-    return _needleman_wunsch_numba(S, gap_penalty)
+def smith_waterman(S: np.ndarray, gap_open: float = -1.0, gap_extend: float = -0.1):
+    return _smith_waterman_affine_numba(S, gap_open, gap_extend)
 
 
+def needleman_wunsch(S: np.ndarray, gap_open: float = -1.0, gap_extend: float = -0.1):
+    return _needleman_wunsch_affine_numba(S, gap_open, gap_extend)
 
-def align_proteins(id_a: str, id_b: str,
-                   mode: str = "local",
-                   gap_penalty: float = -1.0):
-    """
-    End-to-end: load embeddings -> similarity matrix -> alignment.
-    Returns (score, path).
-    """
-    emb_a = torch.load(EMB_DIR / f"{id_a}.pt", weights_only=True)
-    emb_b = torch.load(EMB_DIR / f"{id_b}.pt", weights_only=True)
-    S     = compute_similarity_matrix(emb_a, emb_b).numpy()
+
+def align_proteins(
+    id_a: str,
+    id_b: str,
+    version: str = "v1",
+    mode: str = "local",
+    gap_open: float = -1.0,
+    gap_extend: float = -0.1,
+):
+    emb_a = load_embedding(id_a, version)
+    emb_b = load_embedding(id_b, version)
+    S = compute_similarity_matrix(emb_a, emb_b).numpy()
 
     if mode == "local":
-        return smith_waterman(S, gap_penalty)
-    else:
-        return needleman_wunsch(S, gap_penalty)
+        return smith_waterman(S, gap_open=gap_open, gap_extend=gap_extend)
+    return needleman_wunsch(S, gap_open=gap_open, gap_extend=gap_extend)
 
 
-# ─── Quick test ────────────────────────────────────────────────────
 if __name__ == "__main__":
+    args = parse_args()
+    version = normalize_version(args.version)
     import pandas as pd
 
-    pairs = pd.read_csv(
-        Path(__file__).resolve().parent.parent / "data" / "test_pairs.csv"
-    )
-
-    print("Testing Smith-Waterman on first 5 pairs:\n")
-    for _, row in pairs.head(5).iterrows():
-        score, path = align_proteins(row["id_a"], row["id_b"], mode="local")
+    pairs = pd.read_csv(DATA_DIR / "test_pairs.csv")
+    print(f"Testing {args.mode} alignment on the first {args.pairs} pairs ({version}):\n")
+    for _, row in pairs.head(args.pairs).iterrows():
+        score, path = align_proteins(
+            row["id_a"],
+            row["id_b"],
+            version=version,
+            mode=args.mode,
+            gap_open=args.gap_open,
+            gap_extend=args.gap_extend,
+        )
         label = "HOMOLOG" if row["label"] == 1 else "NON-HOMOLOG"
-        print(f"  {row['id_a']} vs {row['id_b']}  [{label}]")
-        print(f"    SW score: {score:.2f}   path length: {len(path)}")
+        print(f"  {row['id_a']} vs {row['id_b']} [{label}]")
+        print(f"    score: {score:.2f}   matched residues: {len(path)}")

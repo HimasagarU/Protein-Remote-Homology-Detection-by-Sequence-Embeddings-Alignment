@@ -1,0 +1,12 @@
+{
+  "ROC-AUC": 0.6717,
+  "PR-AUC": 0.6772,
+  "Precision@10": 1.0,
+  "Recall@10": 0.0323,
+  "Precision@25": 0.92,
+  "Recall@25": 0.0742,
+  "Precision@50": 0.78,
+  "Recall@50": 0.1258,
+  "Precision@100": 0.75,
+  "Recall@100": 0.2419
+}

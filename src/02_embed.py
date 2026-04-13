@@ -1,86 +1,98 @@
 """
-Phase 2b -- Multi-Layer ESM-2 Embedding Extraction.
+Phase 2 -- ESM-2 embedding extraction for the supported pipelines.
 
-Extracts per-residue embeddings by averaging the last 4 hidden layers
-of ESM-2, which captures a richer mix of structural information than
-using only the final layer.
-
-Output: embeddings_v2/<domain_id>.pt  shape [L, 1280]
+`v1`: save the final hidden layer to `embeddings/`
+`v3`: average the last 4 hidden layers and save to `embeddings_v3/`
 """
 
+import argparse
 import os
-os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+from pathlib import Path
 
 import torch
-from pathlib import Path
 from Bio import SeqIO
 from transformers import AutoTokenizer, EsmModel
 
-# ─── Config ────────────────────────────────────────────────────────
-ROOT       = Path(__file__).resolve().parent.parent
-FASTA_PATH = ROOT / "data" / "astral_20_clean.fasta"
-EMB_DIR    = ROOT / "embeddings_v2"
-EMB_DIR.mkdir(exist_ok=True)
+from pipeline_common import DATA_DIR, get_embedding_dir, normalize_version
 
-MODEL_NAME = "facebook/esm2_t33_650M_UR50D"   # 650M params, 33 layers, dim=1280
-MAX_LEN    = 1022                               # 1024 - 2 special tokens
-BATCH_LOG  = 100
-N_LAYERS_AVG = 4                                # Average last N layers
 
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
+
+MODEL_NAME = "facebook/esm2_t33_650M_UR50D"
+FASTA_PATH = DATA_DIR / "astral_20_clean.fasta"
+MAX_LEN = 1022  # ESM-2 max tokens minus CLS/EOS
+BATCH_LOG = 100
+V3_LAYER_COUNT = 4
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-# ─── Load model ────────────────────────────────────────────────────
+
 print(f"Loading {MODEL_NAME} on {DEVICE} ...")
 tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-model     = EsmModel.from_pretrained(MODEL_NAME).to(DEVICE).eval()
-print(f"Model ready. Will average last {N_LAYERS_AVG} layers.\n")
+model = EsmModel.from_pretrained(MODEL_NAME).to(DEVICE).eval()
+print("Model ready.\n")
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Extract ESM-2 embeddings for v1 or v3.")
+    parser.add_argument(
+        "--version",
+        choices=["v1", "v3"],
+        default="v3",
+        help="Embedding variant to extract.",
+    )
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Recompute embeddings even if the output file already exists.",
+    )
+    return parser.parse_args()
 
 
 @torch.no_grad()
-def extract_multilayer_embedding(sequence: str) -> torch.Tensor:
+def extract_embedding(sequence: str, version: str) -> torch.Tensor:
     """
-    Returns per-residue embedding by averaging last N hidden layers.
-    Output: Tensor [L, D] where D=1280
+    Return a per-residue embedding tensor with shape [L, 1280].
     """
-    seq    = sequence[:MAX_LEN].upper()
+    seq = sequence[:MAX_LEN].upper()
     inputs = tokenizer(seq, return_tensors="pt", add_special_tokens=True).to(DEVICE)
-    
     outputs = model(**inputs, output_hidden_states=True)
-    # outputs.hidden_states is a tuple of (n_layers+1) tensors, each [1, L+2, D]
-    # Layer 0 = embedding layer, layers 1..33 = transformer layers
     hidden_states = outputs.hidden_states
-    
-    # Average the last N_LAYERS_AVG layers
-    last_n = torch.stack(hidden_states[-N_LAYERS_AVG:], dim=0)  # [N, 1, L+2, D]
-    averaged = last_n.mean(dim=0)                                # [1, L+2, D]
-    
-    # Strip CLS and EOS tokens
-    return averaged[0, 1:-1, :].cpu()                            # [L, D]
+
+    if version == "v1":
+        residue_states = hidden_states[-1]
+    else:
+        residue_states = torch.stack(hidden_states[-V3_LAYER_COUNT:], dim=0).mean(dim=0)
+
+    return residue_states[0, 1:-1, :].cpu()
 
 
-# ─── Main loop ─────────────────────────────────────────────────────
 if __name__ == "__main__":
+    args = parse_args()
+    version = normalize_version(args.version)
+    emb_dir = get_embedding_dir(version, create=True)
     records = list(SeqIO.parse(str(FASTA_PATH), "fasta"))
-    total   = len(records)
-    done    = 0
+    total = len(records)
+    done = 0
     skipped = 0
 
-    print(f"Extracting multi-layer embeddings for {total} sequences ...\n")
+    print(f"Extracting {version} embeddings for {total} sequences -> {Path(emb_dir).name}\n")
 
-    for i, record in enumerate(records):
-        out_path = EMB_DIR / f"{record.id}.pt"
-
-        # Skip if already extracted (resume-safe)
-        if out_path.exists():
+    for i, record in enumerate(records, start=1):
+        out_path = emb_dir / f"{record.id}.pt"
+        if out_path.exists() and not args.overwrite:
             skipped += 1
             done += 1
             continue
 
-        emb = extract_multilayer_embedding(str(record.seq))
+        emb = extract_embedding(str(record.seq), version=version)
         torch.save(emb, str(out_path))
         done += 1
 
-        if (i + 1) % BATCH_LOG == 0 or (i + 1) == total:
-            print(f"  [{done}/{total}]  {record.id}  shape={tuple(emb.shape)}  (skipped {skipped} existing)")
+        if i % BATCH_LOG == 0 or i == total:
+            print(
+                f"  [{done}/{total}] {record.id} shape={tuple(emb.shape)} "
+                f"(skipped {skipped} existing)"
+            )
 
-    print(f"\nDone. {done}/{total} embeddings saved to {EMB_DIR}")
+    print(f"\nDone. Saved {done - skipped if not args.overwrite else done} embeddings to {emb_dir}")
